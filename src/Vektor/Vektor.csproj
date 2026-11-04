@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk" xmlns:android="http://schemas.android.com/apk/res/android">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-android</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <UseMaui>true</UseMaui>
+    <SingleProject>true</SingleProject>
+    <RootNamespace>Vektor</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+
+    <!-- Id — плейсхолдер спайка; финальный package ID согласуется отдельным решением до v1 (docs/decisions.md). -->
+    <ApplicationId>com.vektor.app</ApplicationId>
+    <ApplicationTitle>Вектор</ApplicationTitle>
+
+    <!-- min SDK 34 (Android 14+), control target SDK выбирается отдельно; Debug-сборка arm64 для спайка. -->
+    <SupportedOSPlatformVersion>34.0</SupportedOSPlatformVersion>
+    <RuntimeIdentifiers>android-arm64</RuntimeIdentifiers>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <UsesPermission Include="android.permission.RECORD_AUDIO" />
+    <UsesPermission Include="android.permission.POST_NOTIFICATIONS" />
+    <UsesPermission Include="android.permission.FOREGROUND_SERVICE" />
+    <UsesPermission Include="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <UsesPermission Include="android.permission.SCHEDULE_EXACT_ALARM" />
+    <UsesPermission Include="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <UsesPermission Include="android.permission.WAKE_LOCK" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- версия берётся из установленного workload-манифеста (MA002 подсказывает 10.0.20), не выдумана -->
+    <PackageReference Include="Microsoft.Maui.Controls" Version="10.0.20" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Vektor.Core\Vektor.Core.csproj" />
+  </ItemGroup>
+
+</Project>

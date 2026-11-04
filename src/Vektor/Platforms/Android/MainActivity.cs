@@ -3,6 +3,7 @@ using Android.Content;
 using Android.Content.PM;
 using Android.OS;
 using Vektor.Core;
+using Vektor.Platforms.Android;
 
 namespace Vektor.Platforms.Android;
 
@@ -14,24 +15,27 @@ namespace Vektor.Platforms.Android;
     ConfigurationChanges = ConfigChanges.ScreenSize | ConfigChanges.Orientation | ConfigChanges.UiMode)]
 public sealed class MainActivity : MauiAppCompatActivity
 {
-    private const int PermissionRequestCode = 1001;
+    private const int RecordAudioRequestCode = 1101;
+    private const int PostNotificationsRequestCode = 1102;
 
     public void StartAppCapture()
     {
-        // AppManualCapture: интерактивный запуск, значит activity имеет законный пользовательский запуск записи.
-        var required = new[]
+        // Разрешения раздельные: микрофон — единственный обязательный для записи,
+        // уведомления нужны для Stop-кнопки/результатов в фоне (не блокируют старт записи приложения).
+        if (CheckSelfPermission(global::Android.Manifest.Permission.RecordAudio) != Permission.Granted)
         {
-            global::Android.Manifest.Permission.RecordAudio,
-            global::Android.Manifest.Permission.PostNotifications,
-        };
-
-        if (required.All(p => CheckSelfPermission(p) == Permission.Granted))
-        {
-            LaunchCapture();
+            RequestPermissions([global::Android.Manifest.Permission.RecordAudio], RecordAudioRequestCode);
             return;
         }
 
-        RequestPermissions(required, PermissionRequestCode);
+        if (CheckSelfPermission(global::Android.Manifest.Permission.PostNotifications) != Permission.Granted)
+        {
+            // Уведомления НЕ блокирует старт записи: предлагаем выдать, но запись продолжаем без него.
+            RequestPermissions([global::Android.Manifest.Permission.PostNotifications], PostNotificationsRequestCode);
+            AppStatusStore.Instance.SetInfo("Уведомления не выданы: Stop-кнопка в фоне будет недоступна, запись всё равно идёт.");
+        }
+
+        LaunchCapture();
     }
 
     public void StopCapture()
@@ -44,43 +48,65 @@ public sealed class MainActivity : MauiAppCompatActivity
         if (!ReminderScheduler.CanScheduleExact(this))
         {
             // Честный статус: нет права exact — ведём в системные настройки, не имитируем точное напоминание.
+            AppStatusStore.Instance.SetError("Система не разрешает exact alarms: напоминание будет с окном до 15 минут. Разрешение — в настройках.");
             StartActivity(new Intent(global::Android.Provider.Settings.ActionRequestScheduleExactAlarm));
             return;
         }
 
         var status = ReminderScheduler.ScheduleOneOff(this, TimeSpan.FromMinutes(1));
-        var message = status == ReminderScheduleStatus.ExactScheduled
-            ? "Exact alarm установлен на текущее время + 1 минута"
-            : $"Приблизительный режим (конец окна ~15 мин): {status}";
-        Notifications.Post(this, 105, VoiceSessionService.ChannelResults, "Напоминание запланировано", message);
+        if (status == ReminderScheduleStatus.ExactScheduled)
+        {
+            AppStatusStore.Instance.SetInfo("Напоминание через 1 минуту (exact alarm).");
+        }
+        else
+        {
+            AppStatusStore.Instance.SetError("Напоминание запланировано приблизительно (окно ≤15 мин) — точного ожидания не гарантируем.");
+        }
+    }
+
+    /// <summary>Отмена тестового напоминания: bump версии + cancel alarm (не маскируем как «точное прошло»).</summary>
+    public void CancelTestReminder()
+    {
+        ReminderScheduler.CancelOneOff(this);
+        AppStatusStore.Instance.SetInfo("Тестовое напоминание отменено (identity инвалидирована).");
     }
 
     public override void OnRequestPermissionsResult(int requestCode, string[] permissions, Permission[] grantResults)
     {
         base.OnRequestPermissionsResult(requestCode, permissions, grantResults);
-
-        if (requestCode != PermissionRequestCode)
+        if (grantResults.Length == 0 || grantResults.All(g => g != Permission.Granted))
         {
-            return;
+            switch (requestCode)
+            {
+                case RecordAudioRequestCode:
+                    // Только экран, не молчание: уведомления может не быть — но приложение открыто.
+                    AppStatusStore.Instance.SetError("Микрофон запрещён: запись не началась. Разрешение — в настройках приложения.");
+                    break;
+
+                case PostNotificationsRequestCode:
+                    Notifications.Post(this, 104, NotificationChannels.Results,
+                        "Вектор: нет разрешений на уведомления",
+                        "Без них Stop-кнопка в фоне и напоминания не отобразятся.");
+                    AppStatusStore.Instance.SetError("Уведомления запрещены: Stop-кнопка в фоне и результат уведомлением не придут.");
+                    break;
+            }
         }
-
-        if (grantResults.Length > 0 && grantResults.All(g => g == Permission.Granted))
+        else if (requestCode == RecordAudioRequestCode)
         {
+            // Выдали микрофон — старт записи продолжим без немедленного resend POST_NOTIFICATIONS.
             LaunchCapture();
-        }
-        else
-        {
-            Notifications.Post(this, 104, VoiceSessionService.ChannelResults, "Разрешения не выданы",
-                "Без микрофона запись не начнётся. Разрешение можно выдать в настройках приложения.");
         }
     }
 
     private void LaunchCapture()
     {
         // Одна сессия: если уже идёт запись — второй старт просто игнорируется сервисом.
-        if (!VoiceSessionStore.Instance.Running)
+        if (VoiceSessionStore.Instance.Running)
         {
-            StartForegroundService(VoiceIntents.CaptureIntent(this, CaptureSource.AppManualCapture));
+            return;
         }
+        AppStatusStore.Instance.ClearError();
+        AppStatusStore.Instance.SetInfo($"Запись начата ({CaptureSource.AppManualCapture}); стоп — вручную.");
+        StartForegroundService(VoiceIntents.CaptureIntent(this, CaptureSource.AppManualCapture));
     }
 }

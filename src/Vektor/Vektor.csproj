@@ -20,16 +20,6 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <UsesPermission Include="android.permission.RECORD_AUDIO" />
-    <UsesPermission Include="android.permission.POST_NOTIFICATIONS" />
-    <UsesPermission Include="android.permission.FOREGROUND_SERVICE" />
-    <UsesPermission Include="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
-    <UsesPermission Include="android.permission.SCHEDULE_EXACT_ALARM" />
-    <UsesPermission Include="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <UsesPermission Include="android.permission.WAKE_LOCK" />
-  </ItemGroup>
-
-  <ItemGroup>
     <!-- версия берётся из установленного workload-манифеста (MA002 подсказывает 10.0.20), не выдумана -->
     <PackageReference Include="Microsoft.Maui.Controls" Version="10.0.20" />
   </ItemGroup>

@@ -24,6 +24,9 @@ internal static class Notifications
             return;
         }
 
+        // Канал на чистой установке может отсутствовать (например, reboot-receiver без первого запуска записи).
+        NotificationChannels.Ensure(context);
+
         var builder = new Notification.Builder(context, channelId)
             .SetSmallIcon(Resource.Drawable.widget_mic)
             .SetContentTitle(title)

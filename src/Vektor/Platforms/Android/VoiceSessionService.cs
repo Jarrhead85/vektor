@@ -8,8 +8,9 @@ namespace Vektor.Platforms.Android;
 
 /// <summary>
 /// Микрофонный foreground service (AndroidManifest: microphone type).
-/// Lifecycle записи владеет сервис; виджет и UI видят общий VoiceSessionStore, PCM им не доставляется.
+/// Lifecycle записи — сервис; виджет и UI видят общий VoiceSessionStore, PCM им не доставляется.
 /// Start/stop идемпотентны: одна сессия в каждый момент.
+/// NotSticky: запись не воскрешается системой после kill; OnDestroy финализирует активную сессию.
 /// </summary>
 [Service(
     Name = "com.vektor.VoiceSessionService",
@@ -18,45 +19,67 @@ namespace Vektor.Platforms.Android;
     ForegroundServiceType = ForegroundService.TypeMicrophone)]
 public sealed class VoiceSessionService : Service
 {
-    public const string ChannelRecording = "vektor_recording";
-    public const string ChannelResults = "vektor_results";
     public const int RecordingNotificationId = 101;
+    public const int ResultNotificationId = 102;
     public const int LimitWarningNotificationId = 103;
 
     private static readonly object Sync = new();
     private static VoiceSessionService? activeService;
     private static VoiceRecordingSession? activeSession;
+    private static volatile bool destroyed;
 
     public override void OnCreate()
     {
         base.OnCreate();
-        CreateNotificationChannels();
+        NotificationChannels.Ensure(this);
+        destroyed = false;
     }
 
     public override StartCommandResult OnStartCommand(Intent? intent, StartCommandFlags flags, int startId)
     {
-        switch (intent?.Action)
+        // null/unknown intent (restart/спорно предназначенный): без активной сессии сервис не висит.
+        var action = intent?.Action;
+        if (action != VoiceIntents.ActionStop &&
+            action != VoiceIntents.ActionStartAppManual &&
+            action != VoiceIntents.ActionStartWidgetQuick &&
+            action != VoiceIntents.ActionWidgetToggle)
+        {
+            if (activeSession is null)
+            {
+                StopSelf();
+            }
+            return StartCommandResult.NotSticky;
+        }
+
+        switch (action)
         {
             case VoiceIntents.ActionStop:
-                // Stop из уведомления или из UI приложения: single-flight машины дедуплицирует гонку.
                 lock (Sync)
                 {
-                    activeSession?.RequestUserStop();
+                    var session = activeSession;
+                    if (session is not null)
+                    {
+                        session.RequestUserStop();
+                    }
+                    else
+                    {
+                        // STOP без активной сессии: не маскируем успех, просто не оставляем висящий сервис.
+                        StopSelf();
+                    }
                 }
                 break;
 
             case VoiceIntents.ActionStartAppManual:
             case VoiceIntents.ActionStartWidgetQuick:
-                TryStartCapture(intent.Action == VoiceIntents.ActionStartWidgetQuick);
+                TryStartCapture(widget: action == VoiceIntents.ActionStartWidgetQuick);
                 break;
 
             case VoiceIntents.ActionWidgetToggle:
-                // Повторное нажатие кнопки виджета останавливает запись.
                 lock (Sync)
                 {
                     if (activeSession is { } running)
                     {
-                        running.RequestUserStop();
+                        running.RequestUserStop(); // повторное нажатие кнопки виджета = stop
                     }
                     else
                     {
@@ -66,7 +89,7 @@ public sealed class VoiceSessionService : Service
                 break;
         }
 
-        return StartCommandResult.Sticky;
+        return StartCommandResult.NotSticky;
     }
 
     private void TryStartCapture(bool widget)
@@ -74,7 +97,8 @@ public sealed class VoiceSessionService : Service
         if (CheckSelfPermission(global::Android.Manifest.Permission.RecordAudio) != Permission.Granted)
         {
             // Не открываем Activity из фона: честное уведомление с переходом в приложение.
-            Notifications.Post(this, 102, ChannelResults, "Вектор: нужно разрешение",
+            Notifications.Post(this, ResultNotificationId, NotificationChannels.Results,
+                "Вектор: нужно разрешение",
                 "Разреши микрофон в приложении Вектор — запись виджета не началась.");
             StopSelf();
             return;
@@ -82,13 +106,14 @@ public sealed class VoiceSessionService : Service
 
         lock (Sync)
         {
-            if (activeSession is not null)
+            if (activeSession is not null || destroyed)
             {
-                return; // одна сессия
+                return; // одна сессия; сервис в разрушении — новые старты не принимаем
             }
 
             activeService = this;
-            activeSession = new VoiceRecordingSession(this, widget ? CaptureSource.WidgetQuickCapture : CaptureSource.AppManualCapture);
+            activeSession = new VoiceRecordingSession(this,
+                widget ? CaptureSource.WidgetQuickCapture : CaptureSource.AppManualCapture);
             activeSession.Start();
         }
     }
@@ -103,19 +128,21 @@ public sealed class VoiceSessionService : Service
         }
     }
 
-    private void CreateNotificationChannels()
+    /// <summary>Системное разрушение сервиса: активная запись финализируется (ServiceStopped), фрагменты не теряются молча.</summary>
+    public override void OnDestroy()
     {
-        var manager = (NotificationManager)GetSystemService(NotificationService)!;
-        manager.CreateNotificationChannel(new NotificationChannel(
-            ChannelRecording, "Запись Вектор", NotificationImportance.Low)
+        base.OnDestroy();
+
+        VoiceRecordingSession? orphaned;
+        lock (Sync)
         {
-            Description = "Постоянное уведомление активной записи с кнопкой Stop",
-        });
-        manager.CreateNotificationChannel(new NotificationChannel(
-            ChannelResults, "Результаты Вектор", NotificationImportance.Default)
-        {
-            Description = "Результаты записи и напоминания",
-        });
+            destroyed = true;
+            orphaned = activeSession;
+            activeSession = null;
+            activeService = null;
+        }
+
+        orphaned?.RequestServiceStop();
     }
 
     public override IBinder? OnBind(Intent intent) => null;

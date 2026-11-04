@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Android.App;
 using Android.Content;
 using Android.Content.PM;
@@ -8,15 +9,16 @@ using Vektor.Core;
 namespace Vektor.Platforms.Android;
 
 /// <summary>
-/// Одна сессия записи между Start и Terminal.
+/// Одна сессия записи между Start и Terminal (docs/voice-state-machine.md).
 /// VAD спайка — RMS-порог на PCM-кадре 16 kHz; настоящий Vosk/VAD подключается на этапе 2.
-/// Source неизменяем; Stop single-flight; лимит 10 минут и предупреждение выдаёт state machine.
+/// Source неизменяем; Stop single-flight; машина считает время в монотонном Stopwatch-ms.
+/// Finish идемпотентен (Interlocked), причина завершения сохраняется: MicError НЕ маскируется тишиной.
 /// </summary>
 internal sealed class VoiceRecordingSession
 {
     private const int SampleRate = 16_000;
     private const int FrameSize = 512; // ~32 мс при 16 кГц
-    private const double SpeechRmsThreshold = 0.035; // спайк-порог; behaviour VAD этапа 2 заменит
+    private const double SpeechRmsThreshold = 0.035; // спайк-порог; настоящий VAD этапа 2 заменит
 
     private readonly Context context;
     private readonly CaptureSource source;
@@ -26,12 +28,11 @@ internal sealed class VoiceRecordingSession
     private readonly object gate = new();
 
     private AudioRecord? recorder;
-    private Thread? reader;
     private PowerManager.WakeLock? wakeLock;
     private double secondsRecorded;
     private volatile bool stopRequestedByMachine;
-    private bool stopHasAudio = true;
-    private bool finished;
+    private int finished; // 0 = идёт, 1 = финализирована (идемпотентность Finish)
+    private Thread readerThread = null!; // задаётся в Start
 
     public VoiceRecordingSession(Context context, CaptureSource source)
     {
@@ -39,9 +40,12 @@ internal sealed class VoiceRecordingSession
         this.source = source;
     }
 
+    /// <summary>Монотонные millisecond-only для машины (Stopwatch); календарное время — отдельно для отображения.</summary>
+    private static double NowMs() => Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency;
+
     public void Start()
     {
-        var now = DateTime.Now;
+        var now = DateTime.Now; // только отображение
         store.Clear();
         store.Running = true;
         store.ActiveSource = source;
@@ -49,35 +53,56 @@ internal sealed class VoiceRecordingSession
         store.LastResult = null;
 
         AcquireWakeLock();
-        PostRecordingNotification();
-        machine.TryStart(source, now);
+        machine.TryStart(source, NowMs());
 
-        if (!TryOpenRecorder())
+        var foregroundOk = PostRecordingNotification();
+        if (!foregroundOk)
         {
-            machine.StartFailed();
-            Finish(hasAudio: false, result: "Микрофон недоступен — запись не начата");
+            // Частично успешный запуск: foreground не удался — запись НЕ продолжается без нового уведомления.
+            if (machine.Fail(VoiceStopReason.ServiceStopped, NowMs()))
+            {
+                Finish(hasAudio: false);
+            }
             return;
         }
 
-        machine.AudioReady(DateTime.Now);
+        if (!TryOpenRecorder())
+        {
+            // Могли получить RequestStop, пока открывали recorder — не перетираем UserStop.
+            if (machine.Fail(VoiceStopReason.MicError, NowMs()))
+            {
+                Finish(hasAudio: false);
+            }
+            return;
+        }
 
-        reader = new Thread(RecordLoop)
+        machine.AudioReady(NowMs());
+
+        readerThread = new Thread(RecordLoop)
         {
             IsBackground = true,
             Name = "vektor-audio-reader",
         };
-        reader.Start();
+        readerThread.Start();
     }
 
     /// <summary>UserStop/повторный тап виджета/Stop из уведомления. Single-flight внутри машины.</summary>
     public void RequestUserStop()
     {
-        if (machine.RequestStop(DateTime.Now))
+        if (machine.RequestStop(NowMs()))
         {
-            stopHasAudio = true;
             stopRequestedByMachine = true;
             cancelSource.Cancel();
         }
+    }
+
+    /// <summary>Системное разрушение сервиса/системный сбой фона: причина ServiceStopped, фрагменты не теряются молча.</summary>
+    public void RequestServiceStop()
+    {
+        var accepted = machine.Fail(VoiceStopReason.ServiceStopped, NowMs());
+        stopRequestedByMachine = true;
+        cancelSource.Cancel();
+        Finish(hasAudio: machine.SpeechSeen && secondsRecorded > 0 && machine.StopReason != VoiceStopReason.NoSpeech);
     }
 
     private bool TryOpenRecorder()
@@ -121,6 +146,9 @@ internal sealed class VoiceRecordingSession
                 var frames = rec.Read(buffer, 0, buffer.Length);
                 if (frames <= 0)
                 {
+                    // Ошибка чтения микрофона ≠ тишина: фиксируем отдельную причину.
+                    machine.Fail(VoiceStopReason.MicError, NowMs());
+                    stopRequestedByMachine = true;
                     break;
                 }
 
@@ -133,7 +161,7 @@ internal sealed class VoiceRecordingSession
                 var rms = Math.Sqrt(sumSquares / frames) / short.MaxValue;
                 secondsRecorded += frames / (double)SampleRate;
 
-                var signals = machine.AudioFrame(rms > SpeechRmsThreshold, DateTime.Now);
+                var signals = machine.AudioFrame(rms > SpeechRmsThreshold, NowMs());
                 foreach (var signal in signals)
                 {
                     HandleSignal(signal);
@@ -146,20 +174,16 @@ internal sealed class VoiceRecordingSession
         }
         catch (Exception)
         {
-            // Микрофон/системный сбой: сохраняем доступный фрагмент, финализируем корректно (спека §5).
+            // Микрофон/системный сбой на ПОМИДОР этапе цикла: причина отдельна (MicError), фрагмент сохранится.
+            machine.Fail(VoiceStopReason.MicError, NowMs());
+            stopRequestedByMachine = true;
         }
 
-        var hasAudio = machine.SpeechSeen && secondsRecorded > 0;
-        if (stopRequestedByMachine)
-        {
-            hasAudio = machine.SpeechSeen && stopHasAudio && secondsRecorded > 0;
-        }
+        var machineStopReason = machine.StopReason;
+        var hasAudio = machineStopReason != VoiceStopReason.NoSpeech && machine.SpeechSeen && secondsRecorded > 0;
 
-        Finish(
-            hasAudio,
-            hasAudio
-                ? $"Записано {secondsRecorded:0.#} с (распознавание — этап 2, файл не сохранён в спайке)"
-                : "Тишина без речи — заметка не создана");
+        // Если Fail настиг user-stop первым, не перезатираем (machine.Fail вернёт false) — reason уже в машине.
+        Finish(hasAudio);
     }
 
     private void HandleSignal(VoiceSignal signal)
@@ -168,85 +192,122 @@ internal sealed class VoiceRecordingSession
         {
             case VoiceSignalKind.LimitWarning:
                 Notifications.Post(context, VoiceSessionService.LimitWarningNotificationId,
-                    VoiceSessionService.ChannelRecording, "Вектор: остался 1 сегмент",
-                    "До лимита 10 минут — 30 секунд. Досня, нажми ■.");
+                    NotificationChannels.Recording, "Вектор: осталось 30 секунд",
+                    "До лимита 10 минут. Нажми ■, чтобы закончить.");
                 break;
 
             case VoiceSignalKind.AutoStopRequested:
             case VoiceSignalKind.UserStopRequested:
             case VoiceSignalKind.LimitReached:
             case VoiceSignalKind.NoSpeechTimeout:
-                stopHasAudio = signal.Kind != VoiceSignalKind.NoSpeechTimeout;
                 stopRequestedByMachine = true;
                 cancelSource.Cancel();
                 break;
         }
     }
 
-    private void Finish(bool hasAudio, string result)
+    /// <summary>Идемпотентная финализация: Interlocked гарантирует одноразовость из ЛЮБОГО потока.</summary>
+    private void Finish(bool hasAudio)
     {
-        lock (gate)
+        if (Interlocked.Exchange(ref finished, 1) == 1)
         {
-            if (finished)
-            {
-                return;
-            }
-            finished = true;
+            return;
         }
 
         ReleaseRecorder();
 
-        machine.FinalizeAudio(DateTime.Now, hasAudio);
+        var result = BuildResultText(hasAudio);
+        machine.FinalizeAudio(NowMs(), hasAudio);
+
         store.Running = false;
         store.ActiveSource = null;
         store.StartedAt = null;
         store.LastResult = result;
         store.Notify();
 
+        AppStatusStore.Instance.SetInfo(result);
         if (source == CaptureSource.WidgetQuickCapture)
         {
             // Результат из фона — уведомление с переходом к карточке (Activity не открывается произвольно).
-            Notifications.Post(context, 102, VoiceSessionService.ChannelResults, "Вектор: запись завершена", result);
+            Notifications.Post(context, VoiceSessionService.ResultNotificationId,
+                NotificationChannels.Results, "Вектор: запись завершена", result);
         }
 
         ReleaseWakeLock();
         VoiceSessionService.SessionFinished();
     }
 
-    private void PostRecordingNotification()
+    private string BuildResultText(bool hasAudio)
     {
-        var builder = new Notification.Builder(context, VoiceSessionService.ChannelRecording)
-            .SetSmallIcon(Resource.Drawable.widget_mic)
-            .SetContentTitle("Вектор: запись")
-            .SetContentText("Нажми ■, чтобы закончить")
-            .SetOngoing(true);
+        var fragment = $"фрагмент {secondsRecorded:0.#} с";
+        return machine.StopReason switch
+        {
+            VoiceStopReason.NoSpeech => "Тишина без речи — заметка не создана",
+            VoiceStopReason.MicError => $"Запись прервана (ошибка микрофона), сохранён {fragment}",
+            VoiceStopReason.ServiceStopped when hasAudio => $"Сервис остановлен системой, сохранён {fragment}",
+            VoiceStopReason.ServiceStopped => "Запись прервана (сервис остановлен)",
+            VoiceStopReason.User => $"Стоп по кнопке: записано {secondsRecorded:0.#} с",
+            VoiceStopReason.AutoSilence => $"Автостоп (3 с тишины): записано {secondsRecorded:0.#} с",
+            VoiceStopReason.Limit => $"Лимит 10 минут: записано {secondsRecorded:0.#} с",
+            _ => hasAudio ? $"Записано {secondsRecorded:0.#} с" : "Запись завершена",
+        };
+    }
 
-        var stopAction = new Notification.Action.Builder(
-            Resource.Drawable.widget_mic,
-            new Java.Lang.String("Стоп"),
-            PendingIntent.GetService(context, 1, VoiceIntents.StopIntent(context),
-                PendingIntentFlags.Immutable | PendingIntentFlags.UpdateCurrent)).Build();
-        builder.AddAction(stopAction);
+    /// <summary>foregroundServiceType=microphone — обязательный явный тип на Android 14; false при сбое перехода.</summary>
+    private bool PostRecordingNotification()
+    {
+        try
+        {
+            NotificationChannels.Ensure(context);
 
-        var content = PendingIntent.GetActivity(context, 0, new Intent(context, typeof(MainActivity)),
-            PendingIntentFlags.Immutable | PendingIntentFlags.UpdateCurrent);
-        builder.SetContentIntent(content);
+            var builder = new Notification.Builder(context, NotificationChannels.Recording)
+                .SetSmallIcon(Resource.Drawable.widget_mic)
+                .SetContentTitle("Вектор: запись")
+                .SetContentText("Нажми ■, чтобы закончить")
+                .SetOngoing(true);
 
-        // foregroundServiceType=microphone — обязательный явный тип на Android 14.
-        // Сервис уже стартует через StartForegroundService от виджета/UI; здесь только переход в foreground.
-        ((VoiceSessionService)context).StartForeground(
-            VoiceSessionService.RecordingNotificationId,
-            builder.Build(),
-            ForegroundService.TypeMicrophone);
+            var stopAction = new Notification.Action.Builder(
+                Resource.Drawable.widget_mic,
+                new Java.Lang.String("Стоп"),
+                PendingIntent.GetService(context, 1, VoiceIntents.StopIntent(context),
+                    PendingIntentFlags.Immutable | PendingIntentFlags.UpdateCurrent)).Build();
+            builder.AddAction(stopAction);
+
+            var content = PendingIntent.GetActivity(context, 0, new Intent(context, typeof(MainActivity)),
+                PendingIntentFlags.Immutable | PendingIntentFlags.UpdateCurrent);
+            builder.SetContentIntent(content);
+
+            // Сервис уже стартует через StartForegroundService от виджета/UI; здесь только переход в foreground.
+            ((VoiceSessionService)context).StartForeground(
+                VoiceSessionService.RecordingNotificationId,
+                builder.Build(),
+                ForegroundService.TypeMicrophone);
+            return true;
+        }
+        catch (Exception)
+        {
+            // Пропущен call StartForeground в 5с окно/нет типа/системный запрет: не молчим.
+            Notifications.Post(context, VoiceSessionService.ResultNotificationId,
+                NotificationChannels.Results, "Вектор: запись не началась",
+                "Не удалось открыть фоновое уведомление записи (системное ограничение службы).");
+            return false;
+        }
     }
 
     private void AcquireWakeLock()
     {
-        var power = (PowerManager)context.GetSystemService(Context.PowerService)!;
-        wakeLock = power.NewWakeLock(WakeLockFlags.Partial, "vektor:session");
-        wakeLock.SetReferenceCounted(false);
-        // Ограниченный жизнью сессии lock: max 10 мин + запас на финализацию; никакой постоянной фоновости.
-        wakeLock.Acquire((long)TimeSpan.FromMinutes(11).TotalMilliseconds);
+        try
+        {
+            var power = (PowerManager)context.GetSystemService(Context.PowerService)!;
+            wakeLock = power.NewWakeLock(WakeLockFlags.Partial, "vektor:session");
+            wakeLock.SetReferenceCounted(false);
+            // Ограниченный жизнью сессии lock: max 10 мин + запас на финализацию; фоновость не постоянна.
+            wakeLock.Acquire((long)TimeSpan.FromMinutes(11).TotalMilliseconds);
+        }
+        catch (Exception)
+        {
+            wakeLock = null; // без wakeLock запись всё равно возможна; честное ограничение фиксируется отчётом
+        }
     }
 
     private void ReleaseWakeLock()
@@ -257,6 +318,10 @@ internal sealed class VoiceRecordingSession
             {
                 wakeLock.Release();
             }
+        }
+        catch (Exception)
+        {
+            // Уже выпущен системой.
         }
         finally
         {
@@ -280,7 +345,7 @@ internal sealed class VoiceRecordingSession
         }
         catch (Exception)
         {
-            //Release уже сделан системой.
+            // Release уже сделан системой.
         }
         finally
         {
